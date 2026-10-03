@@ -37,6 +37,8 @@ class WeatherServiceTest {
         weatherService = new WeatherService(webClient);
         ReflectionTestUtils.setField(weatherService, "apiKey", "test-api-key");
         ReflectionTestUtils.setField(weatherService, "timeoutMs", 5000);
+        ReflectionTestUtils.setField(weatherService, "maxRetries", 0);
+        ReflectionTestUtils.setField(weatherService, "retryBackoffMs", 0);
     }
 
     @AfterEach

@@ -6,13 +6,14 @@ import com.example.Assesment_two.model.weather.ForecastData;
 import com.example.Assesment_two.model.weather.WeatherApiResponse;
 import com.example.Assesment_two.model.weather.WeatherData;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
-import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.List;
@@ -20,11 +21,10 @@ import java.util.stream.Collectors;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class WeatherService {
 
     private final WebClient weatherWebClient;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${weather.api.key:DEMO_KEY}")
     private String apiKey;
@@ -32,22 +32,26 @@ public class WeatherService {
     @Value("${weather.api.timeout-ms:5000}")
     private int timeoutMs;
 
+    @Value("${weather.api.retry-attempts:3}")
+    private int maxRetries;
+
+    @Value("${weather.api.retry-backoff-ms:500}")
+    private int retryBackoffMs;
+
+    public WeatherService(WebClient weatherWebClient) {
+        this.weatherWebClient = weatherWebClient;
+    }
+
+    @Cacheable(value = "weather-cache", key = "#city.toLowerCase()")
     public WeatherData getCurrentWeather(String city) {
+        long startTime = System.nanoTime();
         log.info("Fetching current weather for city: {}", city);
         try {
-            WeatherApiResponse response = weatherWebClient.get()
-                    .uri(uriBuilder -> uriBuilder
-                            .path("/current.json")
-                            .queryParam("key", apiKey)
-                            .queryParam("q", city)
-                            .queryParam("aq", "no")
-                            .build())
-                    .retrieve()
-                    .bodyToMono(WeatherApiResponse.class)
-                    .timeout(Duration.ofMillis(timeoutMs))
-                    .subscribeOn(Schedulers.boundedElastic())
+            WeatherApiResponse response = buildCurrentWeatherMono(city)
                     .block();
 
+            long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
+            log.info("Weather API call for {} completed in {}ms", city, elapsedMs);
             return processCurrentWeatherResponse(response, city);
         } catch (WeatherApiException | CityNotFoundException e) {
             throw e;
@@ -61,27 +65,20 @@ public class WeatherService {
         }
     }
 
+    @Cacheable(value = "weather-cache", key = "#city.toLowerCase() + '-' + #days")
     public ForecastData getForecast(String city, int days) {
         if (days < 1 || days > 14) {
             throw new WeatherApiException("Days parameter must be between 1 and 14");
         }
 
+        long startTime = System.nanoTime();
         log.info("Fetching {}-day forecast for city: {}", days, city);
         try {
-            WeatherApiResponse response = weatherWebClient.get()
-                    .uri(uriBuilder -> uriBuilder
-                            .path("/forecast.json")
-                            .queryParam("key", apiKey)
-                            .queryParam("q", city)
-                            .queryParam("aq", "no")
-                            .queryParam("days", days)
-                            .build())
-                    .retrieve()
-                    .bodyToMono(WeatherApiResponse.class)
-                    .timeout(Duration.ofMillis(timeoutMs))
-                    .subscribeOn(Schedulers.boundedElastic())
+            WeatherApiResponse response = buildForecastMono(city, days)
                     .block();
 
+            long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
+            log.info("Weather API forecast call for {} completed in {}ms", city, elapsedMs);
             return processForecastResponse(response, city);
         } catch (WeatherApiException | CityNotFoundException e) {
             throw e;
@@ -93,6 +90,62 @@ public class WeatherService {
             }
             throw new WeatherApiException("Failed to fetch forecast for city: " + city + " - " + e.getMessage(), e);
         }
+    }
+
+    @CacheEvict(value = "weather-cache", key = "#city.toLowerCase()")
+    public void evictCache(String city) {
+        log.info("Cache evicted for city: {}", city);
+    }
+
+    private reactor.core.publisher.Mono<WeatherApiResponse> buildCurrentWeatherMono(String city) {
+        var mono = weatherWebClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/current.json")
+                        .queryParam("key", apiKey)
+                        .queryParam("q", city)
+                        .queryParam("aq", "no")
+                        .build())
+                .retrieve()
+                .bodyToMono(WeatherApiResponse.class)
+                .timeout(Duration.ofMillis(timeoutMs));
+
+        if (maxRetries > 0) {
+            mono = mono.retryWhen(buildRetrySpec());
+        }
+        return mono;
+    }
+
+    private reactor.core.publisher.Mono<WeatherApiResponse> buildForecastMono(String city, int days) {
+        var mono = weatherWebClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/forecast.json")
+                        .queryParam("key", apiKey)
+                        .queryParam("q", city)
+                        .queryParam("aq", "no")
+                        .queryParam("days", days)
+                        .build())
+                .retrieve()
+                .bodyToMono(WeatherApiResponse.class)
+                .timeout(Duration.ofMillis(timeoutMs));
+
+        if (maxRetries > 0) {
+            mono = mono.retryWhen(buildRetrySpec());
+        }
+        return mono;
+    }
+
+    private Retry buildRetrySpec() {
+        return Retry.backoff(maxRetries, Duration.ofMillis(retryBackoffMs))
+                .maxBackoff(Duration.ofMillis(Math.max(retryBackoffMs * 4, 2000)))
+                .filter(this::isRetryableError);
+    }
+
+    private boolean isRetryableError(Throwable throwable) {
+        if (throwable instanceof WebClientResponseException ex) {
+            int code = ex.getStatusCode().value();
+            return code == 502 || code == 503 || code == 504;
+        }
+        return throwable instanceof java.util.concurrent.TimeoutException;
     }
 
     private WeatherData processCurrentWeatherResponse(WeatherApiResponse response, String city) {
@@ -265,13 +318,5 @@ public class WeatherService {
         }
 
         return dayData;
-    }
-
-    private void setApiKey(String apiKey) {
-        this.apiKey = apiKey;
-    }
-
-    private void setTimeoutMs(int timeoutMs) {
-        this.timeoutMs = timeoutMs;
     }
 }

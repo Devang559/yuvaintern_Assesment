@@ -6,6 +6,7 @@ import okhttp3.mockwebserver.RecordedRequest;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -33,6 +34,9 @@ class WeatherControllerIntegrationTest {
 
     private MockMvc mockMvc;
 
+    @Autowired
+    private CacheManager cacheManager;
+
     @BeforeAll
     static void startMockServer() throws IOException {
         mockWebServer = new MockWebServer();
@@ -44,6 +48,7 @@ class WeatherControllerIntegrationTest {
         registry.add("weather.api.base-url", () -> mockWebServer.url("/").toString());
         registry.add("weather.api.key", () -> "test-api-key");
         registry.add("weather.api.timeout-ms", () -> "5000");
+        registry.add("weather.api.retry-attempts", () -> "0");
     }
 
     @AfterAll
@@ -54,6 +59,11 @@ class WeatherControllerIntegrationTest {
     @BeforeEach
     void setUp() {
         this.mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext).build();
+        cacheManager.getCacheNames().forEach(name -> {
+            if (cacheManager.getCache(name) != null) {
+                cacheManager.getCache(name).clear();
+            }
+        });
     }
 
     private String loadLondonWeatherResponse() {
